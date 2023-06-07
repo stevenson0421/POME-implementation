@@ -397,7 +397,8 @@ def pome(environment,
         reward_hat = network.reward_network(state, action)
         transition = network.transition_network(state, action)
         transition_reshaped = transition.reshape(state.shape)
-        qb = reward_hat + discount_factor * network.value_network(transition_reshaped)
+        latent_value, _, _ = network.policy_network(transition_reshaped)
+        qb = reward_hat + discount_factor * network.value_network(latent_value)
 
         # calculate pi / pi_old
         policy_ratio = torch.exp(action_logprobability-action_logprobability_old)
@@ -459,10 +460,10 @@ def pome(environment,
         state = data['state']
         action = data['action']
         transition = network.transition_network(state[:-1], action[:-1])
-        transition_reshaped = transition.reshape(state.shape)
+        transition_reshaped = transition.reshape((state.shape[0]-1, state.shape[1], state.shape[2], state.shape[3]))
 
         # calculate transition loss in paper
-        transition_loss = (torch.norm(state[:-1]-transition, p=2) ** 2)
+        transition_loss = (torch.norm(state[:-1]-transition_reshaped, p=2) ** 2)
 
         return transition_loss
 
@@ -489,6 +490,8 @@ def pome(environment,
             value_loss = get_value_loss(data, other_variable)
             transition_loss = get_transition_loss(data)
 
+            print(f'pome_loss: {pome_loss}, value_loss: {value_loss}, transition_loss: {transition_loss}')
+
             total_pome_loss = pome_loss + value_loss_ratio * value_loss + transition_loss_ratio * transition_loss
             total_pome_loss.backward()
 
@@ -499,6 +502,8 @@ def pome(environment,
             reward_optimizer.zero_grad()
 
             reward_loss = get_reward_loss(data)
+
+            print(f'reward_loss: {reward_loss}')
             reward_loss.backward()
 
             reward_optimizer.step()
@@ -561,12 +566,12 @@ if __name__ == '__main__':
     pome(environment=gymnasium.make('PongNoFrameskip-v4', obs_type='grayscale'),
         networkclass=Network,
         number_of_epoch=1,
-        steps_per_epoch=2,
+        steps_per_trajectory=3,
+        max_steps_per_trajectory=10,
         pome_learning_rate=2.5*1e-4,
         reward_learning_rate=0.01,
         train_pome_iterations=2,
         train_reward_iterations=2,
-        max_trajectory_length=2,
         discount_factor=0.99,
         alpha=0.1,
         clip_ratio=0.1,
