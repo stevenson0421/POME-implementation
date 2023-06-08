@@ -27,7 +27,10 @@ def discounted_cumulated_sum(sequence, discount_factor):
 '''
 process state from environment
 
-current implementation is add a dimension for one channel since the state is grayscale image
+current implementation
+    1. resize state
+    2. add a dimension for one channel since the state is grayscale image
+    3. scale values to [0, 1]
 '''
 def process_state(state, new_size):
     state = cv2.resize(state, new_size, interpolation=cv2.INTER_AREA)
@@ -44,6 +47,20 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+
+'''
+shuffle all data in a dictionary
+'''
+def shuffle_data(data, seed):
+    k, v = list(data.items())[0]
+    data_length = len(v)
+    data_shuffled = {}
+    torch.manual_seed(seed)
+    random_indices = torch.randperm(data_length)
+    for k, v in data.items():
+        data_shuffled[k] = v[random_indices]
+    
+    return data_shuffled
 
 '''
 Data Buffer
@@ -323,6 +340,8 @@ input parameters
 
     max_steps_per_trajectory: max steps of a trajectory, basically the time limit of agent (truncated if set)
 
+    batch_size: minibatch size in learning process
+
     pome_learning_rate: learning rate of pome object, consist of policy, value and transition
 
     reward_learning_rate: learning rate of reward estimation, ## note that this is not mentioned in paper
@@ -350,6 +369,7 @@ def pome(environment,
          number_of_epoch,
          steps_per_trajectory,
          max_steps_per_trajectory,
+         batch_size,
          pome_learning_rate,
          reward_learning_rate,
          train_pome_iterations,
@@ -425,7 +445,6 @@ def pome(environment,
 
         # calculate value loss in paper. Note that object is normalized
         value_object_core = a_t_pome + reward_to_go - value
-        value_object_core = (value_object_core - value_object_core.mean()) / value_object_core.std()
         value_loss = ((value_object_core) ** 2).mean()
 
         # calculate transition loss in paper. note that state of 0:-1 are used for calculation, not sure if this is correct
@@ -455,22 +474,6 @@ def pome(environment,
         reward_loss = ((torch.sum(reward_object_core) / state.shape[0]) ** 2)
 
         return reward_loss
-    
-    '''
-    get transition loss
-
-    note that state of 0:-1 are used for calculation, not sure if this is correct
-    '''
-    def get_transition_loss(data):
-        state = data['state']
-        action = data['action']
-        transition = network.transition_network(state[:-1], action[:-1])
-        transition_reshaped = transition.reshape((state.shape[0]-1, state.shape[1], state.shape[2], state.shape[3]))
-
-        # calculate transition loss in paper
-        transition_loss = (torch.norm(state[:-1]-transition_reshaped, p=2) ** 2) / torch.numel(state)
-
-        return transition_loss
 
     pome_optimizer = torch.optim.Adam([{'params':network.policy_network.parameters()},
                                        {'params':network.value_network.parameters()},
@@ -489,27 +492,32 @@ def pome(environment,
 
         # update pome parameters
         for i in range(train_pome_iterations):
-            pome_optimizer.zero_grad()
+            data_shuffled = shuffle_data(data, seed+i)
 
-            pome_loss, value_loss, transition_loss = get_pome_loss(data)
+            for batch_index in range(int(math.floor(steps_per_trajectory / batch_size))):
+                data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size] for k, v in data_shuffled.items()}
 
-            print(f'pome_loss: {pome_loss}, value_loss: {value_loss}, transition_loss: {transition_loss}')
+                pome_optimizer.zero_grad()
 
-            total_pome_loss = pome_loss + value_loss_ratio * value_loss + transition_loss_ratio * transition_loss
-            total_pome_loss.backward()
-
-            pome_optimizer.step()
+                pome_loss, value_loss, transition_loss = get_pome_loss(data_minibatch)
+                total_pome_loss = pome_loss + value_loss_ratio * value_loss + transition_loss_ratio * transition_loss
+                total_pome_loss.backward()
+                pome_optimizer.step()
         
         # update reward parameters
         for i in range(train_reward_iterations):
-            reward_optimizer.zero_grad()
+            data_shuffled = shuffle_data(data, seed+i)
 
-            reward_loss = get_reward_loss(data)
+            for batch_index in range(int(math.floor(steps_per_trajectory / batch_size))):
+                data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size] for k, v in data_shuffled.items()}
 
-            print(f'reward_loss: {reward_loss}')
-            reward_loss.backward()
+                reward_optimizer.zero_grad()
+                reward_loss = get_reward_loss(data_minibatch)
+                reward_loss.backward()
+                reward_optimizer.step()
 
-            reward_optimizer.step()
+        # reset random seed
+        torch.manual_seed(seed)
 
     # main process
     trajectory_reward = 0
@@ -570,8 +578,9 @@ if __name__ == '__main__':
         state_new_size=(84, 84),
         networkclass=Network,
         number_of_epoch=1,
-        steps_per_trajectory=10,
-        max_steps_per_trajectory=100,
+        steps_per_trajectory=128,
+        max_steps_per_trajectory=1024,
+        batch_size=16,
         pome_learning_rate=2.5*1e-4,
         reward_learning_rate=0.01,
         train_pome_iterations=5,
