@@ -7,6 +7,7 @@ import math
 import gymnasium
 
 import time
+import cv2
 
 '''
 Functions
@@ -28,8 +29,12 @@ process state from environment
 
 current implementation is add a dimension for one channel since the state is grayscale image
 '''
-def process_state(state):
-    return np.expand_dims(state, 0)
+def process_state(state, new_size):
+    state = cv2.resize(state, new_size, interpolation=cv2.INTER_AREA)
+    state_expand = np.expand_dims(state, 0)
+    state_normalized = state_expand / 255.0
+
+    return state_normalized
 
 '''
 set random seeds for reproducibility
@@ -217,7 +222,7 @@ class RewardNetwork(torch.nn.Module):
         return reward
 
 '''
-Reward Network
+Transition Network
 
 current implementation (parameters not mentioned in paper)
 input state + action 1x211x160 (action is one-hot encoded to dimension 1x1x160)
@@ -259,13 +264,8 @@ combine four networks
 the functions can be further optimized
 '''
 class Network(torch.nn.Module):
-    def __init__(self, state_space, action_space):
+    def __init__(self, state_dimension, action_dimension):
         super().__init__()
-
-        assert isinstance(action_space, gymnasium.spaces.Discrete)
-
-        state_dimension = (1, state_space.shape[0], state_space.shape[1])
-        action_dimension = action_space.n
 
         self.policy_network = PolicyNetwork(state_dimension, action_dimension)
         self.value_network = ValueNetwork()
@@ -313,11 +313,13 @@ input parameters
 
     environment: gym environment ex. gym.make('PongNoFrameskip-v4')
 
+    state_new_size: states of environment are resized to this new size
+
     networkclass: combined network
 
     number_of_epoch: the number of epoch in training process
 
-    steps_per_trajectory: steps of a trajectory
+    steps_per_trajectory: steps of a trajectory (k in paper)
 
     max_steps_per_trajectory: max steps of a trajectory, basically the time limit of agent (truncated if set)
 
@@ -343,6 +345,7 @@ input parameters
 
 '''
 def pome(environment,
+         state_new_size,
          networkclass,
          number_of_epoch,
          steps_per_trajectory,
@@ -359,17 +362,20 @@ def pome(environment,
          seed
          ):
     
+    assert isinstance(environment.action_space, gymnasium.spaces.Discrete)
+
     set_seed(seed)
     
     # current implementation (210, 160)
-    state_space = environment.observation_space
+    # state_space = environment.observation_space
+    state_dimension = (1, state_new_size[0], state_new_size[1])
     # current implementation Discrete(6)
-    action_space = environment.action_space
-
-    network = networkclass(state_space, action_space)
+    action_dimension = environment.action_space.n
+    
+    network = networkclass(state_dimension, action_dimension)
 
     # state dimension is (1, 210, 160), action dimension is 0 (scalar)
-    buffer = Buffer(steps_per_trajectory, tuple([1]+list(state_space.shape)), action_space.shape, discount_factor)
+    buffer = Buffer(steps_per_trajectory, state_dimension, environment.action_space.shape, discount_factor)
 
     '''
     pome loss before combined
@@ -384,6 +390,7 @@ def pome(environment,
         state = data['state']
         action = data['action']
         qf = data['qf']
+        reward_to_go = data['reward_to_go']
         
         # pi_old, note that this is fixed during one epoch update
         action_logprobability_old = data['action_logprobability']
@@ -416,23 +423,19 @@ def pome(environment,
         clip_a_t_pome = torch.clamp(policy_ratio, 1-clip_ratio, 1+clip_ratio) * a_t_pome
         pome_loss = -(torch.min(policy_ratio * a_t_pome, clip_a_t_pome)).mean()
 
-        # return a_t_pome and value for value loss
-        other_variable = {'a_t_pome': a_t_pome, 'value': value}
+        # calculate value loss in paper. Note that object is normalized
+        value_object_core = a_t_pome + reward_to_go - value
+        value_object_core = (value_object_core - value_object_core.mean()) / value_object_core.std()
+        value_loss = ((value_object_core) ** 2).mean()
 
-        return pome_loss, other_variable
+        # calculate transition loss in paper. note that state of 0:-1 are used for calculation, not sure if this is correct
+        transition = network.transition_network(state[:-1], action[:-1])
+        transition_reshaped = transition.reshape((state.shape[0]-1, state.shape[1], state.shape[2], state.shape[3]))
+
+        transition_loss = (torch.norm(state[:-1]-transition_reshaped, p=2) ** 2) / torch.numel(state)
+
+        return pome_loss, value_loss, transition_loss
     
-    '''
-    get value loss
-    '''
-    def get_value_loss(data, other_variable):
-        reward_to_go = data['reward_to_go']
-        value = other_variable['value']
-        a_t_pome = other_variable['a_t_pome']
-
-        # calculate value loss in paper
-        value_loss = ((a_t_pome + reward_to_go - value) ** 2).mean()
-
-        return value_loss
     
     '''
     get reward loss
@@ -446,8 +449,10 @@ def pome(environment,
 
         reward_hat = network.reward_network(state, action)
 
+        reward_object_core = reward - reward_hat
+
         # calculate reward loss in paper
-        reward_loss = (torch.sum(reward - reward_hat) ** 2)
+        reward_loss = ((torch.sum(reward_object_core) / state.shape[0]) ** 2)
 
         return reward_loss
     
@@ -463,7 +468,7 @@ def pome(environment,
         transition_reshaped = transition.reshape((state.shape[0]-1, state.shape[1], state.shape[2], state.shape[3]))
 
         # calculate transition loss in paper
-        transition_loss = (torch.norm(state[:-1]-transition_reshaped, p=2) ** 2)
+        transition_loss = (torch.norm(state[:-1]-transition_reshaped, p=2) ** 2) / torch.numel(state)
 
         return transition_loss
 
@@ -486,9 +491,7 @@ def pome(environment,
         for i in range(train_pome_iterations):
             pome_optimizer.zero_grad()
 
-            pome_loss, other_variable = get_pome_loss(data)
-            value_loss = get_value_loss(data, other_variable)
-            transition_loss = get_transition_loss(data)
+            pome_loss, value_loss, transition_loss = get_pome_loss(data)
 
             print(f'pome_loss: {pome_loss}, value_loss: {value_loss}, transition_loss: {transition_loss}')
 
@@ -509,14 +512,14 @@ def pome(environment,
             reward_optimizer.step()
 
     # main process
-    start_time = time.time()
-    state, info = environment.reset()
-    state = process_state(state)
-    
     trajectory_reward = 0
     trajectory_length = 0
     trajectory_rewards = []
 
+    start_time = time.time()
+    state, info = environment.reset()
+    state = process_state(state, state_new_size)
+    
     for epoch in range(number_of_epoch):
         for t in range(steps_per_trajectory):
             # get action, action probability in log, value from a state. note that state is unsqueezed as a batch with size 1
@@ -532,7 +535,7 @@ def pome(environment,
             # store all data to buffer
             buffer.store(state, action, reward, value, action_logprobability)
             # update state. this is important!
-            state = process_state(next_state)
+            state = process_state(next_state, state_new_size)
             # set timeout for agent
             timeout = (trajectory_length == max_steps_per_trajectory)
             done = (terminated or truncated or timeout)
@@ -550,7 +553,7 @@ def pome(environment,
                 buffer.done(last_value)
                 # reset the environment. this is important!
                 state = environment.reset()
-                state = process_state(next_state)
+                state = process_state(next_state, state_new_size)
                 # record total reward and reset
                 print(f'Final step {t}: trajectory_reward: {trajectory_reward}, trajectory_length: {trajectory_length}')
                 trajectory_rewards.append(trajectory_reward)
@@ -564,14 +567,15 @@ def pome(environment,
 
 if __name__ == '__main__':
     pome(environment=gymnasium.make('PongNoFrameskip-v4', obs_type='grayscale'),
+        state_new_size=(84, 84),
         networkclass=Network,
         number_of_epoch=1,
-        steps_per_trajectory=3,
-        max_steps_per_trajectory=10,
+        steps_per_trajectory=10,
+        max_steps_per_trajectory=100,
         pome_learning_rate=2.5*1e-4,
         reward_learning_rate=0.01,
-        train_pome_iterations=2,
-        train_reward_iterations=2,
+        train_pome_iterations=5,
+        train_reward_iterations=5,
         discount_factor=0.99,
         alpha=0.1,
         clip_ratio=0.1,
