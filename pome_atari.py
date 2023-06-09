@@ -8,6 +8,7 @@ import gymnasium
 
 import time
 import cv2
+from tqdm import trange
 
 '''
 Functions
@@ -16,11 +17,11 @@ Functions
 '''
 calclate discounted cumulated sum for a sequence (np array or tensor) and a discount factor
 '''
-def discounted_cumulated_sum(sequence, discount_factor):
+def discounted_cumulated_sum(sequence, discount_factor, device=None):
     if isinstance(sequence, np.ndarray):
             return scipy.signal.lfilter([1], [1, float(-discount_factor)], sequence[::-1], axis=0)[::-1]
     elif isinstance(sequence, torch.Tensor):
-            return torch.as_tensor(np.ascontiguousarray(scipy.signal.lfilter([1], [1, float(-discount_factor)], sequence.detach().numpy()[::-1], axis=0)[::-1]), dtype=torch.float32)
+            return torch.as_tensor(np.ascontiguousarray(scipy.signal.lfilter([1], [1, float(-discount_factor)], sequence.detach().cpu().numpy()[::-1], axis=0)[::-1]), dtype=torch.float32, device=device)
     else:
             raise TypeError
 
@@ -71,7 +72,7 @@ class Buffer:
     Buffer for storing information of trajectories experienced by POME agent,
     including state, action, qf (TD target), reward, reward-to-go (discounted cumulated reward), value (estimation), action probability in log
     '''
-    def __init__(self, size, state_dimension, action_dimension, discount_factor=0.99):
+    def __init__(self, size, state_dimension, action_dimension, discount_factor, device):
         self.state_buffer = np.zeros(tuple([size]+list(state_dimension)), dtype=np.float32)
         self.action_buffer = np.zeros(tuple([size]+list(action_dimension)), dtype=np.float32)
         self.qf_buffer = np.zeros(size, dtype=np.float32)
@@ -84,6 +85,8 @@ class Buffer:
         self.pointer = 0
         self.start_index = 0
         self.max_size = size
+
+        self.device = device
     
     '''
     store informations of one state-action pair
@@ -134,7 +137,7 @@ class Buffer:
                     reward_to_go=self.reward_to_go_buffer,
                     value=self.value_buffer,
                     action_logprobability=self.action_logprobability_buffer)
-        return {key: torch.as_tensor(value, dtype=torch.float32) for key, value in data.items()}
+        return {key: torch.as_tensor(value, dtype=torch.float32, device=self.device) for key, value in data.items()}
 
 '''
 Policy Network
@@ -307,7 +310,7 @@ class Network(torch.nn.Module):
             action = policy_distribution.sample()
             action_logprobability = policy_distribution.log_prob(action)
             value = self.value_network(latent)
-        return action.numpy(), action_logprobability.numpy(), value.numpy()
+        return action.cpu().numpy(), action_logprobability.cpu().numpy(), value.cpu().numpy()
     
     '''
     get action only from a state
@@ -318,7 +321,7 @@ class Network(torch.nn.Module):
         with torch.no_grad():
             latent, policy, policy_distribution = self.policy_network(state)
             action = policy_distribution.sample()
-        return action.numpy()
+        return action.cpu().numpy()
 
 
 '''
@@ -336,11 +339,13 @@ input parameters
 
     number_of_epoch: the number of epoch in training process
 
-    steps_per_trajectory: steps of a trajectory (k in paper)
+    steps_per_epoch: steps of a epoch
 
-    max_steps_per_trajectory: max steps of a trajectory, basically the time limit of agent (truncated if set)
+    substeps_per_epoch: substeps of a epoch. note that this is for saving memory with long steps
 
-    batch_size: minibatch size in learning process
+    steps_per_trajectory: max steps of a trajectory, basically the time limit of agent (truncated if set)
+
+    batch_size: minibatch size in learning process (k in paper)
 
     pome_learning_rate: learning rate of pome object, consist of policy, value and transition
 
@@ -362,13 +367,16 @@ input parameters
 
     seed: seed for randomization
 
+    device: device for all torch tensors
+
 '''
 def pome(environment,
          state_new_size,
          networkclass,
          number_of_epoch,
+         steps_per_epoch,
+         substeps_per_epoch,
          steps_per_trajectory,
-         max_steps_per_trajectory,
          batch_size,
          pome_learning_rate,
          reward_learning_rate,
@@ -379,7 +387,8 @@ def pome(environment,
          clip_ratio,
          value_loss_ratio,
          transition_loss_ratio,
-         seed
+         seed,
+         device
          ):
     
     assert isinstance(environment.action_space, gymnasium.spaces.Discrete)
@@ -392,15 +401,15 @@ def pome(environment,
     # current implementation Discrete(6)
     action_dimension = environment.action_space.n
     
-    network = networkclass(state_dimension, action_dimension)
+    network = networkclass(state_dimension, action_dimension).to(device)
 
     # state dimension is (1, 210, 160), action dimension is 0 (scalar)
-    buffer = Buffer(steps_per_trajectory, state_dimension, environment.action_space.shape, discount_factor)
+    buffer = Buffer(substeps_per_epoch, state_dimension, environment.action_space.shape, discount_factor, 'cpu')
 
     '''
     pome loss before combined
 
-    note that the KL divergence in paper is not included:   
+    note that the KL divergence in paper is not included:
         1. I think this is duplicated with the clip trick
         2. the value of coefficient Beta is not mentioned
 
@@ -437,7 +446,7 @@ def pome(environment,
         delta_t_pome = qf + alpha * torch.clamp(epsilon-epsilon_median, -delta_t, delta_t) - value
 
         # calculate a_t_pome in paper
-        a_t_pome = discounted_cumulated_sum(delta_t_pome, 1)
+        a_t_pome = discounted_cumulated_sum(delta_t_pome, 1, device)
 
         # calculate pome loss in paper
         clip_a_t_pome = torch.clamp(policy_ratio, 1-clip_ratio, 1+clip_ratio) * a_t_pome
@@ -479,7 +488,7 @@ def pome(environment,
                                        {'params':network.value_network.parameters()},
                                        {'params':network.transition_network.parameters()},], lr=pome_learning_rate)
     # learning rate is linearly annealed [1, 0]
-    torch.optim.lr_scheduler.LinearLR(optimizer=pome_optimizer, start_factor=1., end_factor=0.)
+    torch.optim.lr_scheduler.LinearLR(optimizer=pome_optimizer, start_factor=1., end_factor=0., total_iters=steps_per_epoch*number_of_epoch)
 
     reward_optimizer = torch.optim.Adam(params=network.reward_network.parameters(), lr=reward_learning_rate)
     
@@ -491,11 +500,11 @@ def pome(environment,
         data = buffer.get()
 
         # update pome parameters
-        for i in range(train_pome_iterations):
+        for i in trange(train_pome_iterations):
             data_shuffled = shuffle_data(data, seed+i)
 
-            for batch_index in range(int(math.floor(steps_per_trajectory / batch_size))):
-                data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size] for k, v in data_shuffled.items()}
+            for batch_index in range(int(math.floor(substeps_per_epoch / batch_size))):
+                data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size].to(device) for k, v in data_shuffled.items()}
 
                 pome_optimizer.zero_grad()
 
@@ -505,16 +514,19 @@ def pome(environment,
                 pome_optimizer.step()
         
         # update reward parameters
-        for i in range(train_reward_iterations):
+        for i in trange(train_reward_iterations):
             data_shuffled = shuffle_data(data, seed+i)
 
-            for batch_index in range(int(math.floor(steps_per_trajectory / batch_size))):
-                data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size] for k, v in data_shuffled.items()}
+            for batch_index in range(int(math.floor(substeps_per_epoch / batch_size))):
+                data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size].to(device) for k, v in data_shuffled.items()}
 
                 reward_optimizer.zero_grad()
                 reward_loss = get_reward_loss(data_minibatch)
                 reward_loss.backward()
                 reward_optimizer.step()
+
+
+        print(f'pome loss: {pome_loss}, value loss: {value_loss}, transition loss: {transition_loss}, reward loss: {reward_loss}')
 
         # reset random seed
         torch.manual_seed(seed)
@@ -529,65 +541,80 @@ def pome(environment,
     state = process_state(state, state_new_size)
     
     for epoch in range(number_of_epoch):
-        for t in range(steps_per_trajectory):
-            # get action, action probability in log, value from a state. note that state is unsqueezed as a batch with size 1
-            action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32).unsqueeze(0))
-            # get scalar
-            action = action.item()
-            action_logprobability = action_logprobability.item()
-            value = value.item()
-            # agent interaction
-            next_state, reward, terminated, truncated, info = environment.step(action)
-            trajectory_reward += reward
-            trajectory_length += 1
-            # store all data to buffer
-            buffer.store(state, action, reward, value, action_logprobability)
-            # update state. this is important!
-            state = process_state(next_state, state_new_size)
-            # set timeout for agent
-            timeout = (trajectory_length == max_steps_per_trajectory)
-            done = (terminated or truncated or timeout)
-            # epoch is ended with full steps
-            epoch_ended = (t == steps_per_trajectory-1)
-            # end trajectory. note that timeout and epoch_ended are same if we set the same boundary
-            if done or epoch_ended:
-                if epoch_ended and not done:
-                    print('Warning: trajectory cut off by epoch at %d steps.'%trajectory_length)
+        print(f'epoch: {epoch}')
+        number_of_subepoch = int(math.floor(steps_per_epoch / substeps_per_epoch))
 
-                if timeout or epoch_ended:
-                    _, last_value, _ = network.step(torch.as_tensor(state, dtype=torch.float32).unsqueeze(0))
-                else:
-                    last_value = 0
-                buffer.done(last_value)
-                # reset the environment. this is important!
-                state = environment.reset()
+        for subepoch in range(number_of_subepoch):
+            print(f'subepoch: {subepoch}')
+            
+            print('interacting phase')
+            network.to('cpu')
+            for step in range(substeps_per_epoch):
+                # get action, action probability in log, value from a state. note that state is unsqueezed as a batch with size 1
+                action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
+                # get scalar
+                action = action.item()
+                action_logprobability = action_logprobability.item()
+                value = value.item()
+                # agent interaction
+                next_state, reward, terminated, truncated, info = environment.step(action)
+                trajectory_reward += reward
+                trajectory_length += 1
+                # store all data to buffer
+                buffer.store(state, action, reward, value, action_logprobability)
+                # update state. this is important!
                 state = process_state(next_state, state_new_size)
-                # record total reward and reset
-                print(f'Final step {t}: trajectory_reward: {trajectory_reward}, trajectory_length: {trajectory_length}')
-                trajectory_rewards.append(trajectory_reward)
-                trajectory_reward = 0
-                trajectory_length = 0
+                # set timeout for agent
+                timeout = (trajectory_length == steps_per_trajectory)
+                done = (terminated or truncated or timeout)
+                # epoch is ended with full steps
+                epoch_ended = ((step+(subepoch-1)*number_of_subepoch) == steps_per_epoch-1)
+                # end trajectory. note that timeout and epoch_ended are same if we set the same boundary
+                if done or epoch_ended:
+                    if epoch_ended and not done:
+                        print('Warning: trajectory cut off by epoch at %d steps.'%trajectory_length)
+
+                    if timeout or epoch_ended:
+                        _, last_value, _ = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
+                    else:
+                        last_value = 0
+                    buffer.done(last_value)
+                    # reset the environment. this is important!
+                    state = environment.reset()
+                    state = process_state(next_state, state_new_size)
+                    # record total reward and reset
+                    print(f'trajectory ends with step {step}: trajectory_reward: {trajectory_reward}, trajectory_length: {trajectory_length}')
+                    trajectory_rewards.append(trajectory_reward)
+                    trajectory_reward = 0
+                    trajectory_length = 0
+
+                    if epoch_ended:
+                        break
         
-        update()
+            print('training phase')
+            network.to(device)
+            update()
     print(f'Train Time: {(time.time() - start_time):2f} seconds')
     # average reward of last 100 trajectories in paper
     print(f'Train Score: {np.mean(trajectory_rewards[-100:])}')
 
 if __name__ == '__main__':
-    pome(environment=gymnasium.make('PongNoFrameskip-v4', obs_type='grayscale'),
+    pome(environment=gymnasium.make('ALE/Pong-v5', obs_type='grayscale'),
         state_new_size=(84, 84),
         networkclass=Network,
-        number_of_epoch=1,
-        steps_per_trajectory=128,
-        max_steps_per_trajectory=1024,
-        batch_size=16,
+        number_of_epoch=10000,
+        steps_per_epoch=1000000,
+        substeps_per_epoch=10000,
+        steps_per_trajectory=1000000,
+        batch_size=128,
         pome_learning_rate=2.5*1e-4,
         reward_learning_rate=0.01,
-        train_pome_iterations=5,
-        train_reward_iterations=5,
+        train_pome_iterations=100,
+        train_reward_iterations=100,
         discount_factor=0.99,
         alpha=0.1,
         clip_ratio=0.1,
         value_loss_ratio=1,
         transition_loss_ratio=2,
-        seed=24)
+        seed=24,
+        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
