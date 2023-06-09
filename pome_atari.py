@@ -63,6 +63,7 @@ def shuffle_data(data, seed):
     
     return data_shuffled
 
+
 '''
 Data Buffer
 '''
@@ -151,6 +152,7 @@ linear (output dim=6) ## output one-hot action
 
 output includes latent, policy and policy distribution
 '''
+
 class PolicyNetwork(torch.nn.Module):
     def __init__(self, state_dimension, action_dimension):
         super().__init__()
@@ -160,18 +162,31 @@ class PolicyNetwork(torch.nn.Module):
                                       kernel_size=8,
                                       stride=4,
                                       padding='valid')
+        torch.nn.init.orthogonal_(self.conv1.weight, gain=math.sqrt(2))
+        torch.nn.init.zeros_(self.conv1.bias)
         conv1_dimension = (math.floor((state_dimension[1]-8)/4)+1, math.floor((state_dimension[2]-8)/4)+1)
+
         self.conv2 = torch.nn.Conv2d(in_channels=16,
                                       out_channels=32,
                                       kernel_size=4,
                                       stride=2,
                                       padding='valid')
+        torch.nn.init.orthogonal_(self.conv2.weight, gain=math.sqrt(2))
+        torch.nn.init.zeros_(self.conv2.bias)
         conv2_dimension = (math.floor((conv1_dimension[0]-4)/2)+1, math.floor((conv1_dimension[1]-4)/2)+1)
+
         self.fc1 = torch.nn.Linear(in_features=conv2_dimension[0]*conv2_dimension[1]*32,
                                       out_features=256)
+        torch.nn.init.orthogonal_(self.fc1.weight, gain=math.sqrt(2))
+        torch.nn.init.zeros_(self.fc1.bias)
+
         self.fc2 = torch.nn.Linear(in_features=256,
                                        out_features=action_dimension)
+        torch.nn.init.orthogonal_(self.fc2.weight, gain=0.01)
+        torch.nn.init.zeros_(self.fc2.bias)
+
         self.activation = torch.nn.ReLU()
+
         self.flatten = torch.nn.Flatten()
 
     def forward(self, state):
@@ -199,10 +214,11 @@ class ValueNetwork(torch.nn.Module):
 
         self.fc1 = torch.nn.Linear(in_features=latent_dimension,
                                       out_features=1)
-        self.activation = torch.nn.ReLU()
+        torch.nn.init.orthogonal_(self.fc1.weight, gain=1)
+        torch.nn.init.zeros_(self.fc1.bias)
 
     def forward(self, latent):
-        value = self.activation(self.fc1(latent))
+        value = self.fc1(latent)
 
         return value
         
@@ -224,9 +240,14 @@ class RewardNetwork(torch.nn.Module):
                                       kernel_size=8,
                                       stride=4,
                                       padding='valid')
+        torch.nn.init.orthogonal_(self.conv1.weight, gain=math.sqrt(2))
+        torch.nn.init.zeros_(self.conv1.bias)
         conv1_dimension = (math.floor((state_action_dimension[1]-8)/4)+1, math.floor((state_action_dimension[2]-8)/4)+1)
+
         self.fc1 = torch.nn.Linear(in_features=conv1_dimension[0]*conv1_dimension[1]*16,
                                       out_features=1)
+        torch.nn.init.orthogonal_(self.fc1.weight, gain=1)
+        torch.nn.init.zeros_(self.fc1.bias)
         self.flatten = torch.nn.Flatten()
     
     def forward(self, state, action):
@@ -259,10 +280,17 @@ class TransitionNetwork(torch.nn.Module):
                                       kernel_size=8,
                                       stride=4,
                                       padding='valid')
+        torch.nn.init.orthogonal_(self.conv1.weight, gain=math.sqrt(2))
+        torch.nn.init.zeros_(self.conv1.bias)
         conv1_dimension = (math.floor((state_action_dimension[1]-8)/4)+1, math.floor((state_action_dimension[2]-8)/4)+1)
+        
         self.fc1 = torch.nn.Linear(in_features=conv1_dimension[0]*conv1_dimension[1]*16,
                                       out_features=state_dimension[1]*state_dimension[2])
+        torch.nn.init.orthogonal_(self.fc1.weight, gain=0.01)
+        torch.nn.init.zeros_(self.fc1.bias)
+
         self.flatten = torch.nn.Flatten()
+        self.activation = torch.nn.Sigmoid()
     
     def forward(self, state, action):
         # concatenate state and action
@@ -272,7 +300,7 @@ class TransitionNetwork(torch.nn.Module):
 
         transition = self.conv1(state_action)
         transition = self.flatten(transition)
-        transition = self.fc1(transition)
+        transition = self.activation(self.fc1(transition))
 
         return transition
 
@@ -427,6 +455,7 @@ def pome(environment,
         # get policy, action probability in log and value
         latent, policy, policy_distribution = network.policy_network(state)
         value = network.value_network(latent)
+        value = value.squeeze()
         action_logprobability = policy_distribution.log_prob(action)
 
         # calculate Q_b_t in paper
@@ -435,6 +464,7 @@ def pome(environment,
         transition_reshaped = transition.reshape(state.shape)
         latent_value, _, _ = network.policy_network(transition_reshaped)
         qb = reward_hat + discount_factor * network.value_network(latent_value)
+        qb = qb.squeeze()
 
         # calculate pi / pi_old
         policy_ratio = torch.exp(action_logprobability-action_logprobability_old)
@@ -602,7 +632,7 @@ if __name__ == '__main__':
     pome(environment=gymnasium.make('ALE/Pong-v5', obs_type='grayscale'),
         state_new_size=(84, 84),
         networkclass=Network,
-        number_of_epoch=10000,
+        number_of_epoch=10,
         steps_per_epoch=1000000,
         substeps_per_epoch=10000,
         steps_per_trajectory=1000000,
