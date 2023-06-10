@@ -16,7 +16,7 @@ from datetime import datetime
 Global tensorboard writer
 '''
 # Initialize a SummaryWriter for TensorBoard
-writer = SummaryWriter(log_dir=f'./experiments/pome/runs/{datetime.now()}')
+writer = SummaryWriter(log_dir=f'./experiments/ppo/runs/{datetime.now()}')
 
 '''
 Functions
@@ -84,7 +84,7 @@ class Buffer:
     def __init__(self, size, state_dimension, action_dimension, discount_factor, device):
         self.state_buffer = np.zeros(tuple([size]+list(state_dimension)), dtype=np.float32)
         self.action_buffer = np.zeros(tuple([size]+list(action_dimension)), dtype=np.float32)
-        self.qf_buffer = np.zeros(size, dtype=np.float32)
+        self.advantage_buffer = np.zeros(size, dtype=np.float32)
         self.reward_buffer = np.zeros(size, dtype=np.float32)
         self.reward_to_go_buffer = np.zeros(size, dtype=np.float32)
         self.value_buffer = np.zeros(size, dtype=np.float32)
@@ -121,7 +121,7 @@ class Buffer:
         value_list = np.append(self.value_buffer[trajectory_slice], last_value)
 
         # calculate Q_ft in paper
-        self.qf_buffer[trajectory_slice] = reward_list[:-1] + self.discount_factor * value_list[1:]
+        self.advantage_buffer[trajectory_slice] = reward_list[:-1] + self.discount_factor * value_list[1:] - value_list[:-1]
 
         # calculate reward-to-go (discounted cumulated reward)
         self.reward_to_go_buffer[trajectory_slice] = discounted_cumulated_sum(reward_list, self.discount_factor)[:-1]
@@ -141,7 +141,7 @@ class Buffer:
 
         data = dict(state=self.state_buffer,
                     action=self.action_buffer,
-                    qf=self.qf_buffer,
+                    advantage=self.advantage_buffer,
                     reward=self.reward_buffer,
                     reward_to_go=self.reward_to_go_buffer,
                     value=self.value_buffer,
@@ -231,88 +231,6 @@ class ValueNetwork(torch.nn.Module):
         value = self.fc1(latent)
 
         return value
-        
-'''
-Reward Network
-
-current implementation (not mentioned in paper)
-input state + action 1x211x160 (action is one-hot encoded to dimension 1x1x160)
-conv2d (output dim=16, kernel_size=8, stride=4, no padding) 16x51x39
-linear (output dim=1) ## output reward
-'''
-class RewardNetwork(torch.nn.Module):
-    def __init__(self, state_dimension):
-        super().__init__()
-
-        state_action_dimension = (state_dimension[0], state_dimension[1]+1, state_dimension[2])
-        self.conv1 = torch.nn.Conv2d(in_channels=state_action_dimension[0],
-                                      out_channels=16,
-                                      kernel_size=8,
-                                      stride=4,
-                                      padding='valid')
-        torch.nn.init.orthogonal_(self.conv1.weight, gain=math.sqrt(2))
-        torch.nn.init.zeros_(self.conv1.bias)
-        conv1_dimension = (math.floor((state_action_dimension[1]-8)/4)+1, math.floor((state_action_dimension[2]-8)/4)+1)
-
-        self.fc1 = torch.nn.Linear(in_features=conv1_dimension[0]*conv1_dimension[1]*16,
-                                      out_features=1)
-        torch.nn.init.orthogonal_(self.fc1.weight, gain=1)
-        torch.nn.init.zeros_(self.fc1.bias)
-        self.flatten = torch.nn.Flatten()
-    
-    def forward(self, state, action):
-        # concatenate state and action
-        action_one_hot = torch.nn.functional.one_hot(action.to(torch.int64), num_classes=state.shape[3])
-        action_one_hot = action_one_hot.unsqueeze(1).unsqueeze(1)
-        state_action = torch.cat((state, action_one_hot), dim=2)
-
-        reward = self.conv1(state_action)
-        reward = self.flatten(reward)
-        reward = self.fc1(reward)
-
-        return reward
-
-'''
-Transition Network
-
-current implementation (parameters not mentioned in paper)
-input state + action 1x211x160 (action is one-hot encoded to dimension 1x1x160)
-conv2d (output dim=16, kernel_size=8, stride=4, no padding) 16x51x39
-linear (output dim=210x160) output new state ## note that this is a flattened image
-'''
-class TransitionNetwork(torch.nn.Module):
-    def __init__(self, state_dimension):
-        super().__init__()
-
-        state_action_dimension = (state_dimension[0], state_dimension[1]+1, state_dimension[2])
-        self.conv1 = torch.nn.Conv2d(in_channels=state_action_dimension[0],
-                                      out_channels=16,
-                                      kernel_size=8,
-                                      stride=4,
-                                      padding='valid')
-        torch.nn.init.orthogonal_(self.conv1.weight, gain=math.sqrt(2))
-        torch.nn.init.zeros_(self.conv1.bias)
-        conv1_dimension = (math.floor((state_action_dimension[1]-8)/4)+1, math.floor((state_action_dimension[2]-8)/4)+1)
-        
-        self.fc1 = torch.nn.Linear(in_features=conv1_dimension[0]*conv1_dimension[1]*16,
-                                      out_features=state_dimension[1]*state_dimension[2])
-        torch.nn.init.orthogonal_(self.fc1.weight, gain=0.01)
-        torch.nn.init.zeros_(self.fc1.bias)
-
-        self.flatten = torch.nn.Flatten()
-        self.activation = torch.nn.Sigmoid()
-    
-    def forward(self, state, action):
-        # concatenate state and action
-        action_one_hot = torch.nn.functional.one_hot(action.to(torch.int64), num_classes=state.shape[3])
-        action_one_hot = action_one_hot.unsqueeze(1).unsqueeze(1)
-        state_action = torch.cat((state, action_one_hot), dim=2)
-
-        transition = self.conv1(state_action)
-        transition = self.flatten(transition)
-        transition = self.activation(self.fc1(transition))
-
-        return transition
 
 '''
 Network
@@ -327,8 +245,6 @@ class Network(torch.nn.Module):
 
         self.policy_network = PolicyNetwork(state_dimension, action_dimension)
         self.value_network = ValueNetwork()
-        self.reward_network = RewardNetwork(state_dimension)
-        self.transition_network = TransitionNetwork(state_dimension)
 
     '''
     get the log probability of an action
@@ -363,7 +279,7 @@ class Network(torch.nn.Module):
 
 
 '''
-pome
+ppo
 
 main implementation of the method
 
@@ -385,49 +301,37 @@ input parameters
 
     batch_size: minibatch size in learning process (k in paper)
 
-    pome_learning_rate: learning rate of pome object, consist of policy, value and transition
+    policy_learning_rate: learning rate of ppo object, consist of policy, value
 
-    reward_learning_rate: learning rate of reward estimation, ## note that this is not mentioned in paper
-
-    train_pome_iterations: how many iterations to update pome parameters in one update ## note that this is not mentioned in paper
-    
-    train_reward_iterations: how many iterations to update reward parameters in one update ## note that this is not mentioned in paper
+    train_iterations: how many iterations to update ppo parameters in one update
 
     discount_factor: discount factor (gamma) of computing discounted cumulated sum
 
-    alpha: coefficient used in POME TD error
+    clip_ratio: clip ratio for PPO object before combined (l^PPO in paper)
 
-    clip_ratio: clip ratio for POME object before combined (l^POME in paper)
-
-    value_loss_ratio: coefficient of value loss for combined POME object
-
-    transition_loss_ratio: coefficient of transition loss for combined POME object
+    value_loss_ratio: coefficient of value loss for combined PPO object
 
     seed: seed for randomization
 
     device: device for all torch tensors
 
 '''
-def pome(environment,
-         state_new_size,
-         networkclass,
-         number_of_epoch,
-         steps_per_epoch,
-         steps_per_subepoch,
-         steps_per_trajectory,
-         batch_size,
-         pome_learning_rate,
-         reward_learning_rate,
-         train_pome_iterations,
-         train_reward_iterations,
-         discount_factor,
-         alpha,
-         clip_ratio,
-         value_loss_ratio,
-         transition_loss_ratio,
-         seed,
-         device
-         ):
+def ppo(environment,
+        state_new_size,
+        networkclass,
+        number_of_epoch,
+        steps_per_epoch,
+        steps_per_subepoch,
+        steps_per_trajectory,
+        batch_size,
+        policy_learning_rate,
+        train_iterations,
+        discount_factor,
+        value_loss_ratio,
+        clip_ratio,
+        seed,
+        device
+        ):
     
     assert isinstance(environment.action_space, gymnasium.spaces.Discrete)
 
@@ -444,16 +348,13 @@ def pome(environment,
     # state dimension is (1, 210, 160), action dimension is 0 (scalar)
     buffer = Buffer(steps_per_subepoch, state_dimension, environment.action_space.shape, discount_factor, device)
 
-    pome_optimizer = torch.optim.Adam([{'params':network.policy_network.parameters()},
-                                       {'params':network.value_network.parameters()},
-                                       {'params':network.transition_network.parameters()},], lr=pome_learning_rate)
+    policy_optimizer = torch.optim.Adam([{'params':network.policy_network.parameters()},
+                                         {'params':network.value_network.parameters()},], lr=policy_learning_rate)
     # learning rate is linearly annealed [1, 0]
-    torch.optim.lr_scheduler.LinearLR(optimizer=pome_optimizer, start_factor=1., end_factor=0., total_iters=steps_per_epoch*number_of_epoch)
-
-    reward_optimizer = torch.optim.Adam(params=network.reward_network.parameters(), lr=reward_learning_rate)
+    torch.optim.lr_scheduler.LinearLR(optimizer=policy_optimizer, start_factor=1., end_factor=0., total_iters=steps_per_epoch*number_of_epoch)
     
     '''
-    update all network parameters in paper. first update pome, then reward
+    update all network parameters
     '''
     def update(current_step):
         '''
@@ -462,20 +363,20 @@ def pome(environment,
         # get all data from buffer, which should be a trajectory
         data = buffer.get()
 
-        # update pome parameters
-        for i in trange(train_pome_iterations):
+        # update ppo parameters
+        for i in trange(train_iterations):
             data_shuffled = shuffle_data(data, seed+i)
 
             for batch_index in range(int(math.floor(steps_per_subepoch / batch_size))):
                 data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size].to(device) for k, v in data_shuffled.items()}
                 state = data_minibatch['state']
                 action = data_minibatch['action']
-                qf = data_minibatch['qf']
-                reward_to_go = data_minibatch['reward_to_go']
+                advantage = data_minibatch['advantage']
                 # pi_old, note that this is fixed during one epoch update
                 action_logprobability_old = data_minibatch['action_logprobability']
+                reward_to_go = data_minibatch['reward_to_go']
 
-                pome_optimizer.zero_grad()
+                policy_optimizer.zero_grad()
                 
                 '''
                 note that the KL divergence in paper is not included:
@@ -488,72 +389,24 @@ def pome(environment,
                 action_logprobability = network.policy_network.policy_distribution.log_prob(action)
                 value = network.value_network(latent)
                 value = value.squeeze()
-                # calculate Q_b_t in paper
-                reward_hat = network.reward_network(state, action)
-                transition = network.transition_network(state, action)
-                transition_reshaped = transition.reshape(state.shape)
-                latent_value, _, = network.policy_network(transition_reshaped)
-                qb = reward_hat + discount_factor * network.value_network(latent_value)
-                qb = qb.squeeze()
+
+                value_loss = ((value - reward_to_go)**2).mean()
+                
                 # calculate pi / pi_old
                 policy_ratio = torch.exp(action_logprobability-action_logprobability_old)
-                # calculate epsilon and epsilon_bar in paper
-                epsilon = torch.abs(qf - qb)
-                epsilon_median = torch.median(epsilon)
-                delta_t = torch.abs(qf - value)
-                delta_t_pome = qf + alpha * torch.clamp(epsilon-epsilon_median, -delta_t, delta_t) - value
-                # calculate a_t_pome in paper
-                a_t_pome = discounted_cumulated_sum(delta_t_pome, 1, device)
-                # calculate pome loss in paper
-                clip_a_t_pome = torch.clamp(policy_ratio, 1-clip_ratio, 1+clip_ratio) * a_t_pome
-                pome_loss = -(torch.min(policy_ratio * a_t_pome, clip_a_t_pome)).mean()
+                # calculate policy loss in paper
+                clip_advantage = torch.clamp(policy_ratio, 1-clip_ratio, 1+clip_ratio) * advantage
+                policy_loss = -(torch.min(policy_ratio * advantage, clip_advantage)).mean()
 
-                # calculate value loss in paper. Note that object is normalized
-                value_object_core = a_t_pome + reward_to_go - value
-                value_loss = ((value_object_core) ** 2).mean()
-
-                # calculate transition loss in paper. note that state of 0:-1 are used for calculation, not sure if this is correct
-                transition = network.transition_network(state[:-1], action[:-1])
-                transition_reshaped = transition.reshape((state.shape[0]-1, state.shape[1], state.shape[2], state.shape[3]))
-                transition_loss = (torch.norm(state[:-1]-transition_reshaped, p=2) ** 2) / torch.numel(state)
-
-                total_pome_loss = pome_loss + value_loss_ratio * value_loss + transition_loss_ratio * transition_loss
-                total_pome_loss.backward()
-                pome_optimizer.step()
-        
-        # update reward parameters
-        for i in trange(train_reward_iterations):
-            data_shuffled = shuffle_data(data, seed+i)
-
-            for batch_index in range(int(math.floor(steps_per_subepoch / batch_size))):
-                data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size].to(device) for k, v in data_shuffled.items()}
-                state = data_minibatch['state']
-                action = data_minibatch['action']
-                reward = data_minibatch['reward']
-
-                reward_optimizer.zero_grad()
-                
-                # calculate reward loss in paper
-                reward_hat = network.reward_network(state, action)
-                reward_object_core = reward - reward_hat                
-                reward_loss = (torch.mean(reward_object_core) ** 2)
-
-                reward_loss.backward()
-                reward_optimizer.step()
+                total_loss = policy_loss + value_loss_ratio * value_loss
+                total_loss.backward()
+                policy_optimizer.step()
 
 
-        print(f'pome loss: {pome_loss}, value loss: {value_loss}, transition loss: {transition_loss}, reward loss: {reward_loss}')
+        print(f'policy loss: {policy_loss}, value loss: {value_loss}')
         # tensorboard recording loss
-        # writer.add_scalars(f'Loss summary', {
-        #     'Pome loss': pome_loss,
-        #     'Value loss': value_loss,
-        #     'Transition loss': transition_loss,
-        #     'Reward loss': reward_loss
-        # }, current_step)
-        writer.add_scalar("Pome loss", pome_loss, global_step=(current_step))
+        writer.add_scalar("Policy loss", policy_loss, global_step=(current_step))
         writer.add_scalar("Value loss", value_loss, global_step=(current_step))
-        writer.add_scalar("Transition loss", transition_loss, global_step=(current_step))
-        writer.add_scalar("Reward loss", reward_loss, global_step=(current_step))
 
         # reset random seed
         torch.manual_seed(seed)
@@ -647,17 +500,17 @@ def pome(environment,
         state = process_state(next_state, state_new_size)
 
         if (terminated or truncated):
-            out = cv2.VideoWriter(f'./experiments/pome/video/{environment.unwrapped.spec.id}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, screens[0].shape[0:2])
+            out = cv2.VideoWriter(f'./experiments/ppo/video/{environment.unwrapped.spec.id}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, screens[0].shape[0:2])
             for img in screens:
                 out.write(img)
             out.release()        
 
-            torch.save(network.state_dict(), f'./experiments/pome/model/{environment.unwrapped.spec.id}.pth')
+            torch.save(network.state_dict(), f'./experiments/ppo/model/{environment.unwrapped.spec.id}.pth')
 
 
 
 if __name__ == '__main__':
-    pome(environment=gymnasium.make('ALE/RoadRunner-v5', obs_type='grayscale', render_mode='rgb_array'),
+    ppo(environment=gymnasium.make('ALE/RoadRunner-v5', obs_type='grayscale', render_mode='rgb_array'),
         state_new_size=(84, 84),
         networkclass=Network,
         number_of_epoch=10,
@@ -665,15 +518,11 @@ if __name__ == '__main__':
         steps_per_subepoch=1000,
         steps_per_trajectory=100000,
         batch_size=5,
-        pome_learning_rate=2.5*1e-4,
-        reward_learning_rate=0.01,
-        train_pome_iterations=1,
-        train_reward_iterations=1,
+        policy_learning_rate=2.5*1e-4,
+        train_iterations=1,
         discount_factor=0.99,
-        alpha=0.1,
         clip_ratio=0.1,
-        value_loss_ratio=1,
-        transition_loss_ratio=2,
+        value_loss_ratio=0.5,
         seed=24,
         device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     
