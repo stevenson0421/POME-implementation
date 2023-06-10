@@ -10,13 +10,6 @@ import gymnasium
 import time
 import cv2
 from tqdm import trange
-from datetime import datetime
-
-'''
-Global tensorboard writer
-'''
-# Initialize a SummaryWriter for TensorBoard
-writer = SummaryWriter(log_dir=f'./experiments/ppo/runs/{datetime.now()}')
 
 '''
 Functions
@@ -510,20 +503,26 @@ def ppo(environment,
 
 
 if __name__ == '__main__':
-    ppo(environment=gymnasium.make('ALE/RoadRunner-v5', obs_type='grayscale', render_mode='rgb_array'),
-        state_new_size=(84, 84),
-        networkclass=Network,
-        number_of_epoch=10,
-        steps_per_epoch=100000,
-        steps_per_subepoch=1000,
-        steps_per_trajectory=100000,
-        batch_size=5,
-        policy_learning_rate=2.5*1e-4,
-        train_iterations=1,
-        discount_factor=0.99,
-        clip_ratio=0.1,
-        value_loss_ratio=0.5,
-        seed=24,
-        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    for env_name in ['ALE/RoadRunner-v5', 'ALE/Kangaroo-v5', 'ALE/Alien-v5']:
+        # Initialize a SummaryWriter for TensorBoard
+        writer = SummaryWriter(log_dir=f'./experiments/ppo/runs/{time.strftime("%Y%m%d-%H%M%S")}')
+
+        print(env_name)
+
+        ppo(environment=gymnasium.make(env_name, obs_type='grayscale', render_mode='rgb_array'),
+            state_new_size=(84, 84),
+            networkclass=Network,
+            number_of_epoch=10,
+            steps_per_epoch=100000,
+            steps_per_subepoch=1000,
+            steps_per_trajectory=100000,
+            batch_size=5,
+            policy_learning_rate=2.5*1e-4,
+            train_iterations=1,
+            discount_factor=0.99,
+            clip_ratio=0.1,
+            value_loss_ratio=0.5,
+            seed=24,
+            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     
-    writer.close()
+        writer.close()

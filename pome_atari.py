@@ -10,13 +10,7 @@ import gymnasium
 import time
 import cv2
 from tqdm import trange
-from datetime import datetime
 
-'''
-Global tensorboard writer
-'''
-# Initialize a SummaryWriter for TensorBoard
-writer = SummaryWriter(log_dir=f'./experiments/pome/runs/{datetime.now()}')
 
 '''
 Functions
@@ -432,6 +426,8 @@ def pome(environment,
     assert isinstance(environment.action_space, gymnasium.spaces.Discrete)
 
     set_seed(seed)
+
+    env_name = environment.unwrapped.spec.id.replace('/', '_')
     
     # current implementation (210, 160)
     # state_space = environment.observation_space
@@ -647,34 +643,40 @@ def pome(environment,
         state = process_state(next_state, state_new_size)
 
         if (terminated or truncated):
-            out = cv2.VideoWriter(f'./experiments/pome/video/{environment.unwrapped.spec.id}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, screens[0].shape[0:2])
+            out = cv2.VideoWriter(f'./experiments/pome/video/{env_name}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, screens[0].shape[0:2])
             for img in screens:
                 out.write(img)
             out.release()        
 
-            torch.save(network.state_dict(), f'./experiments/pome/model/{environment.unwrapped.spec.id}.pth')
+            torch.save(network.state_dict(), f'./experiments/pome/model/{env_name}.pth')
 
 
 
 if __name__ == '__main__':
-    pome(environment=gymnasium.make('ALE/RoadRunner-v5', obs_type='grayscale', render_mode='rgb_array'),
-        state_new_size=(84, 84),
-        networkclass=Network,
-        number_of_epoch=10,
-        steps_per_epoch=100000,
-        steps_per_subepoch=1000,
-        steps_per_trajectory=100000,
-        batch_size=5,
-        pome_learning_rate=2.5*1e-4,
-        reward_learning_rate=0.01,
-        train_pome_iterations=1,
-        train_reward_iterations=1,
-        discount_factor=0.99,
-        alpha=0.1,
-        clip_ratio=0.1,
-        value_loss_ratio=1,
-        transition_loss_ratio=2,
-        seed=24,
-        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    
-    writer.close()
+    for env_name in ['ALE/RoadRunner-v5', 'ALE/Kangaroo-v5', 'ALE/Alien-v5']:
+        # Initialize a SummaryWriter for TensorBoard
+        writer = SummaryWriter(log_dir=f'./experiments/pome/runs/{time.strftime("%Y%m%d-%H%M%S")}')
+
+        print(env_name)
+
+        pome(environment=gymnasium.make(env_name, obs_type='grayscale', render_mode='rgb_array'),
+            state_new_size=(84, 84),
+            networkclass=Network,
+            number_of_epoch=10,
+            steps_per_epoch=100000,
+            steps_per_subepoch=1000,
+            steps_per_trajectory=100000,
+            batch_size=5,
+            pome_learning_rate=2.5*1e-4,
+            reward_learning_rate=0.01,
+            train_pome_iterations=1,
+            train_reward_iterations=1,
+            discount_factor=0.99,
+            alpha=0.1,
+            clip_ratio=0.1,
+            value_loss_ratio=1,
+            transition_loss_ratio=2,
+            seed=24,
+            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        
+        writer.close()
