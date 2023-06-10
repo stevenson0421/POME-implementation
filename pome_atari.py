@@ -1,4 +1,5 @@
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import scipy
@@ -9,6 +10,12 @@ import gymnasium
 import time
 import cv2
 from tqdm import trange
+
+'''
+Global tensorboard writer
+'''
+# Initialize a SummaryWriter for TensorBoard
+writer = SummaryWriter()
 
 '''
 Functions
@@ -189,6 +196,8 @@ class PolicyNetwork(torch.nn.Module):
 
         self.flatten = torch.nn.Flatten()
 
+        self.policy_distribution = None
+
     def forward(self, state):
         latent = self.activation(self.conv1(state))
         latent = self.activation(self.conv2(latent))
@@ -196,9 +205,9 @@ class PolicyNetwork(torch.nn.Module):
         latent = self.activation(self.fc1(latent))
         policy = self.activation(self.fc2(latent))
 
-        policy_distribution = torch.distributions.Categorical(logits=policy)
+        self.policy_distribution = torch.distributions.Categorical(logits=policy)
 
-        return latent, policy, policy_distribution
+        return latent, policy
 
 
 '''
@@ -333,12 +342,12 @@ class Network(torch.nn.Module):
     '''
     def step(self, state):
         with torch.no_grad():
-            latent, policy, policy_distribution = self.policy_network(state)
+            latent, policy = self.policy_network(state)
             
-            action = policy_distribution.sample()
-            action_logprobability = policy_distribution.log_prob(action)
+            action = self.policy_network.policy_distribution.sample()
+            action_logprobability = self.policy_network.policy_distribution.log_prob(action)
             value = self.value_network(latent)
-        return action.cpu().numpy(), action_logprobability.cpu().numpy(), value.cpu().numpy()
+        return action.cpu().numpy().item(), action_logprobability.cpu().numpy().item(), value.cpu().numpy().item()
     
     '''
     get action only from a state
@@ -347,8 +356,8 @@ class Network(torch.nn.Module):
     '''
     def act(self, state):
         with torch.no_grad():
-            latent, policy, policy_distribution = self.policy_network(state)
-            action = policy_distribution.sample()
+            latent, policy = self.policy_network(state)
+            action = self.policy_network.policy_distribution.sample()
         return action.cpu().numpy()
 
 
@@ -432,7 +441,7 @@ def pome(environment,
     network = networkclass(state_dimension, action_dimension).to(device)
 
     # state dimension is (1, 210, 160), action dimension is 0 (scalar)
-    buffer = Buffer(substeps_per_epoch, state_dimension, environment.action_space.shape, discount_factor, 'cpu')
+    buffer = Buffer(substeps_per_epoch, state_dimension, environment.action_space.shape, discount_factor, device)
 
     '''
     pome loss before combined
@@ -453,16 +462,17 @@ def pome(environment,
         action_logprobability_old = data['action_logprobability']
 
         # get policy, action probability in log and value
-        latent, policy, policy_distribution = network.policy_network(state)
+        latent, policy = network.policy_network(state)
+        action_logprobability = network.policy_network.policy_distribution.log_prob(action)
+
         value = network.value_network(latent)
         value = value.squeeze()
-        action_logprobability = policy_distribution.log_prob(action)
 
         # calculate Q_b_t in paper
         reward_hat = network.reward_network(state, action)
         transition = network.transition_network(state, action)
         transition_reshaped = transition.reshape(state.shape)
-        latent_value, _, _ = network.policy_network(transition_reshaped)
+        latent_value, _, = network.policy_network(transition_reshaped)
         qb = reward_hat + discount_factor * network.value_network(latent_value)
         qb = qb.squeeze()
 
@@ -525,7 +535,10 @@ def pome(environment,
     '''
     update all network parameters in paper. first update pome, then reward
     '''
-    def update():
+    def update(current_step):
+        '''
+        current_step: the timestep of current update, recorded by tensorboard
+        '''
         # get all data from buffer, which should be a trajectory
         data = buffer.get()
 
@@ -557,6 +570,21 @@ def pome(environment,
 
 
         print(f'pome loss: {pome_loss}, value loss: {value_loss}, transition loss: {transition_loss}, reward loss: {reward_loss}')
+        # tensorboard recording loss
+        writer.add_scalars(f'Loss summary', {
+            'Pome loss': pome_loss,
+            'Value loss': value_loss,
+            'Transition loss': transition_loss,
+            'Reward loss': reward_loss
+        }, current_step)
+        writer.add_scalar("Pome loss", pome_loss, global_step=(current_step))
+        writer.add_scalar("Value loss", value_loss, global_step=(current_step))
+        writer.add_scalar("Transition loss", transition_loss, global_step=(current_step))
+        writer.add_scalar("Reward loss", reward_loss, global_step=(current_step))
+        if current_step == 0:
+            writer.add_graph(network.policy_network, data['state'])
+            writer.add_graph(network.transition_network, [data['state'], data['action']])
+            writer.add_graph(network.reward_network, [data['state'], data['action']])
 
         # reset random seed
         torch.manual_seed(seed)
@@ -582,10 +610,7 @@ def pome(environment,
             for step in range(substeps_per_epoch):
                 # get action, action probability in log, value from a state. note that state is unsqueezed as a batch with size 1
                 action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
-                # get scalar
-                action = action.item()
-                action_logprobability = action_logprobability.item()
-                value = value.item()
+
                 # agent interaction
                 next_state, reward, terminated, truncated, info = environment.step(action)
                 trajectory_reward += reward
@@ -598,7 +623,7 @@ def pome(environment,
                 timeout = (trajectory_length == steps_per_trajectory)
                 done = (terminated or truncated or timeout)
                 # epoch is ended with full steps
-                epoch_ended = ((step+(subepoch-1)*number_of_subepoch) == steps_per_epoch-1)
+                epoch_ended = ((step+subepoch*substeps_per_epoch) == steps_per_epoch-1)
                 # end trajectory. note that timeout and epoch_ended are same if we set the same boundary
                 if done or epoch_ended:
                     if epoch_ended and not done:
@@ -615,15 +640,18 @@ def pome(environment,
                     # record total reward and reset
                     print(f'trajectory ends with step {step}: trajectory_reward: {trajectory_reward}, trajectory_length: {trajectory_length}')
                     trajectory_rewards.append(trajectory_reward)
+                    # record with tensorboard
+                    writer.add_scalar("Trajectory reward", trajectory_reward, global_step=(epoch*number_of_subepoch + subepoch))
                     trajectory_reward = 0
                     trajectory_length = 0
 
                     if epoch_ended:
                         break
-        
+                        
             print('training phase')
             network.to(device)
-            update()
+            current_step = (epoch*number_of_subepoch + subepoch)
+            update(current_step)
     print(f'Train Time: {(time.time() - start_time):2f} seconds')
     # average reward of last 100 trajectories in paper
     print(f'Train Score: {np.mean(trajectory_rewards[-100:])}')
@@ -633,14 +661,14 @@ if __name__ == '__main__':
         state_new_size=(84, 84),
         networkclass=Network,
         number_of_epoch=10,
-        steps_per_epoch=1000000,
-        substeps_per_epoch=10000,
+        steps_per_epoch=20,
+        substeps_per_epoch=10,
         steps_per_trajectory=1000000,
-        batch_size=128,
+        batch_size=5,
         pome_learning_rate=2.5*1e-4,
         reward_learning_rate=0.01,
-        train_pome_iterations=100,
-        train_reward_iterations=100,
+        train_pome_iterations=1,
+        train_reward_iterations=1,
         discount_factor=0.99,
         alpha=0.1,
         clip_ratio=0.1,
@@ -648,3 +676,5 @@ if __name__ == '__main__':
         transition_loss_ratio=2,
         seed=24,
         device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    
+    writer.close()

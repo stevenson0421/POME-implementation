@@ -5,10 +5,16 @@ self implementation of RL method [Policy Optimization with Model-based Explorati
 ## Environment Installation Using Anaconda
 
 ```python
-    conda create --name {env name} python=3.10.11
-    conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
-    pip install scipy opencv-python
-    pip install gymnasium[atari, accept_rom_license]
+    conda create --f environment.yml
+```
+
+## Visualization
+
+Tensorboard logged datas will be located below runs/ directory, to visualize data after a pome run
+
+```python
+    tensorboard --logdir runs or
+    python -m tensorboard.main --logdir=runs
 ```
 
 ## Todos
@@ -17,3 +23,12 @@ self implementation of RL method [Policy Optimization with Model-based Explorati
 2. For reproduction of [OpenAI Baselines](https://github.com/openai/baselines), there are many addtional implementation details, according to [this site](https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/)
 3. Visualization
 4. code for other environments
+
+## Current Implementation
+
+1. fixed-length trajectory segments
+2. Orthogonal Initialization of Weights and Constant Initialization of biases
+3. Mini-batch Updates
+4. Skip Frame
+5. Resize images
+6. Scaling the Images to Range [0, 1]
