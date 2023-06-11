@@ -636,19 +636,32 @@ def pome(environment,
 
     network.to('cpu')
 
-    while True:
-        action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
-        next_state, reward, terminated, truncated, info = environment.step(action)
-        screens.append(environment.render())
-        state = process_state(next_state, state_new_size)
+    trajectory_rewards = []
+    trajectory_reward = 0
+    for i in trange(100):
+        while True:
+            action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
+            next_state, reward, terminated, truncated, info = environment.step(action)
+            screens.append(environment.render())
+            state = process_state(next_state, state_new_size)
 
-        if (terminated or truncated):
-            out = cv2.VideoWriter(f'./experiments/pome/video/{env_name}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, screens[0].shape[0:2])
-            for img in screens:
-                out.write(img)
-            out.release()        
+            trajectory_reward += reward
 
-            torch.save(network.state_dict(), f'./experiments/pome/model/{env_name}.pth')
+            if (terminated or truncated):
+                out = cv2.VideoWriter(f'./experiments/ppo/video/{env_name}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, screens[0].shape[0:2])
+                for img in screens:
+                    out.write(img)
+                out.release()        
+
+                torch.save(network.state_dict(), f'./experiments/ppo/model/{env_name}.pth')
+
+                trajectory_rewards.append(trajectory_reward)
+                trajectory_reward = 0
+
+                break
+
+    with open(f'./experiments/pome/results/{env_name}.txt', 'w') as f:
+        f.write(np.mean(trajectory_rewards))
 
 
 
