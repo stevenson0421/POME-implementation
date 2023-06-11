@@ -458,6 +458,28 @@ def pome(environment,
         # get all data from buffer, which should be a trajectory
         data = buffer.get()
 
+        # calculate Q_b_t in paper
+        state = data['state']
+        action = data['action']
+        qf = data['qf']
+        value = data['value'].squeeze()
+
+        reward_hat = network.reward_network(state, action)
+        transition = network.transition_network(state, action)
+        transition_reshaped = transition.reshape(state.shape)
+        latent_value, _, = network.policy_network(transition_reshaped)
+        qb = reward_hat + discount_factor * network.value_network(latent_value)
+        qb = qb.squeeze()
+        data['qb'] = qb
+
+        # calculate epsilon and epsilon_bar in paper
+        epsilon = torch.abs(qf - qb)
+        epsilon_median = torch.median(epsilon)
+        delta_t = torch.abs(qf - value)
+        delta_t_pome = qf + alpha * torch.clamp(epsilon-epsilon_median, -delta_t, delta_t) - value
+        # calculate a_t_pome in paper
+        data['a_t_pome'] = discounted_cumulated_sum(delta_t_pome, 1, device)
+
         # update pome parameters
         for i in trange(train_pome_iterations):
             data_shuffled = shuffle_data(data, seed+i)
@@ -466,10 +488,10 @@ def pome(environment,
                 data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size].to(device) for k, v in data_shuffled.items()}
                 state = data_minibatch['state']
                 action = data_minibatch['action']
-                qf = data_minibatch['qf']
                 reward_to_go = data_minibatch['reward_to_go']
                 # pi_old, note that this is fixed during one epoch update
                 action_logprobability_old = data_minibatch['action_logprobability']
+                a_t_pome = data_minibatch['a_t_pome']
 
                 pome_optimizer.zero_grad()
                 
@@ -482,30 +504,21 @@ def pome(environment,
                 # get policy, action probability in log and value
                 latent, policy = network.policy_network(state)
                 action_logprobability = network.policy_network.policy_distribution.log_prob(action)
+
                 value = network.value_network(latent)
                 value = value.squeeze()
-                # calculate Q_b_t in paper
-                reward_hat = network.reward_network(state, action)
-                transition = network.transition_network(state, action)
-                transition_reshaped = transition.reshape(state.shape)
-                latent_value, _, = network.policy_network(transition_reshaped)
-                qb = reward_hat + discount_factor * network.value_network(latent_value)
-                qb = qb.squeeze()
+                
+                
+                a_t_pome_st = (a_t_pome - a_t_pome.mean()) / (a_t_pome.std()+1e-8)
+                # calculate pome loss in paper
                 # calculate pi / pi_old
                 policy_ratio = torch.exp(action_logprobability-action_logprobability_old)
-                # calculate epsilon and epsilon_bar in paper
-                epsilon = torch.abs(qf - qb)
-                epsilon_median = torch.median(epsilon)
-                delta_t = torch.abs(qf - value)
-                delta_t_pome = qf + alpha * torch.clamp(epsilon-epsilon_median, -delta_t, delta_t) - value
-                # calculate a_t_pome in paper
-                a_t_pome = discounted_cumulated_sum(delta_t_pome, 1, device)
-                # calculate pome loss in paper
-                clip_a_t_pome = torch.clamp(policy_ratio, 1-clip_ratio, 1+clip_ratio) * a_t_pome
-                pome_loss = -(torch.min(policy_ratio * a_t_pome, clip_a_t_pome)).mean()
+                clip_a_t_pome = torch.clamp(policy_ratio, 1-clip_ratio, 1+clip_ratio) * a_t_pome_st
+                pome_loss = -(torch.min(policy_ratio * a_t_pome_st, clip_a_t_pome)).mean()
 
-                # calculate value loss in paper. Note that object is normalized
+                # calculate value loss in paper.
                 value_object_core = a_t_pome + reward_to_go - value
+                value_object_core = (value_object_core - value_object_core.mean()) / (value_object_core.std()+1e-8)
                 value_loss = ((value_object_core) ** 2).mean()
 
                 # calculate transition loss in paper. note that state of 0:-1 are used for calculation, not sure if this is correct
@@ -629,44 +642,35 @@ def pome(environment,
     # average reward of last 100 trajectories in paper
     print(f'Train Score: {np.mean(trajectory_rewards[-100:])}')
 
-    # testing
+    torch.save(network.state_dict(), f'./experiments/pome/model/{env_name}.pth')
+
+    # record video
     state, info = environment.reset()
     state = process_state(state, state_new_size)
     screens = []
 
     network.to('cpu')
 
-    trajectory_rewards = []
-    trajectory_reward = 0
-    for i in trange(100):
-        while True:
-            action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
-            next_state, reward, terminated, truncated, info = environment.step(action)
-            screens.append(environment.render())
-            state = process_state(next_state, state_new_size)
+    screens = []
+    while True:
+        action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
+        next_state, reward, terminated, truncated, info = environment.step(action)
+        frame = environment.render()
+        screens.append(frame)
+        state = process_state(next_state, state_new_size)
 
-            trajectory_reward += reward
+        if (terminated or truncated):
+            out = cv2.VideoWriter(f'./experiments/pome/video/{env_name}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, (screens[0].shape[1], screens[0].shape[0]))
+            for img in screens:
+                out.write(img)
+            out.release()
 
-            if (terminated or truncated):
-                out = cv2.VideoWriter(f'./experiments/ppo/video/{env_name}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, screens[0].shape[0:2])
-                for img in screens:
-                    out.write(img)
-                out.release()        
-
-                torch.save(network.state_dict(), f'./experiments/ppo/model/{env_name}.pth')
-
-                trajectory_rewards.append(trajectory_reward)
-                trajectory_reward = 0
-
-                break
-
-    with open(f'./experiments/pome/results/{env_name}.txt', 'w') as f:
-        f.write(np.mean(trajectory_rewards))
+            break
 
 
 
 if __name__ == '__main__':
-    for env_name in ['ALE/RoadRunner-v5', 'ALE/Kangaroo-v5', 'ALE/Alien-v5']:
+    for env_name in ['ALE/RoadRunner-v5']:
         # Initialize a SummaryWriter for TensorBoard
         writer = SummaryWriter(log_dir=f'./experiments/pome/runs/{time.strftime("%Y%m%d-%H%M%S")}')
 

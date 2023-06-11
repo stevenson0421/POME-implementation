@@ -378,7 +378,7 @@ def ppo(environment,
                     1. I think this is duplicated with the clip trick
                     2. the value of coefficient Beta is not mentioned
                 '''
-                
+                advantage = (advantage - advantage.mean()) / (advantage.std()+1e-8)
                 # get policy, action probability in log and value
                 latent, policy = network.policy_network(state)
                 action_logprobability = network.policy_network.policy_distribution.log_prob(action)
@@ -481,44 +481,34 @@ def ppo(environment,
     # average reward of last 100 trajectories in paper
     print(f'Train Score: {np.mean(trajectory_rewards[-100:])}')
 
-    # testing
+    torch.save(network.state_dict(), f'./experiments/ppo/model/{env_name}.pth')
+
+    # record video
     state, info = environment.reset()
     state = process_state(state, state_new_size)
     screens = []
 
     network.to('cpu')
 
-    trajectory_rewards = []
-    trajectory_reward = 0
-    for i in trange(100):
-        while True:
-            action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
-            next_state, reward, terminated, truncated, info = environment.step(action)
-            screens.append(environment.render())
-            state = process_state(next_state, state_new_size)
+    screens = []
+    while True:
+        action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
+        next_state, reward, terminated, truncated, info = environment.step(action)
+        frame = environment.render()
+        screens.append(frame)
+        state = process_state(next_state, state_new_size)
 
-            trajectory_reward += reward
+        if (terminated or truncated):
+            out = cv2.VideoWriter(f'./experiments/ppo/video/{env_name}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, (screens[0].shape[1], screens[0].shape[0]))
+            for img in screens:
+                out.write(img)
+            out.release()
 
-            if (terminated or truncated):
-                out = cv2.VideoWriter(f'./experiments/ppo/video/{env_name}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, screens[0].shape[0:2])
-                for img in screens:
-                    out.write(img)
-                out.release()        
-
-                torch.save(network.state_dict(), f'./experiments/ppo/model/{env_name}.pth')
-
-                trajectory_rewards.append(trajectory_reward)
-                trajectory_reward = 0
-
-                break
-
-    with open(f'./experiments/pome/results/{env_name}.txt', 'w') as f:
-        f.write(np.mean(trajectory_rewards))
-
+            break
 
 
 if __name__ == '__main__':
-    for env_name in ['ALE/RoadRunner-v5', 'ALE/Kangaroo-v5', 'ALE/Alien-v5']:
+    for env_name in ['ALE/Amidar-v5', 'ALE/Robotank-v5']:
         # Initialize a SummaryWriter for TensorBoard
         writer = SummaryWriter(log_dir=f'./experiments/ppo/runs/{time.strftime("%Y%m%d-%H%M%S")}')
 
@@ -536,7 +526,7 @@ if __name__ == '__main__':
             train_iterations=1,
             discount_factor=0.99,
             clip_ratio=0.1,
-            value_loss_ratio=0.5,
+            value_loss_ratio=1,
             seed=24,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     
