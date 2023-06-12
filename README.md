@@ -32,3 +32,5 @@ Tensorboard logged datas will be located below runs/ directory, to visualize dat
 4. Skip Frame
 5. Resize images
 6. Scaling the Images to Range [0, 1]
+7. minibatch standardization
+8. remove reward estimation

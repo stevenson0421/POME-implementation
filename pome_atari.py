@@ -10,6 +10,7 @@ import gymnasium
 import time
 import cv2
 from tqdm import trange
+import os
 
 
 '''
@@ -321,7 +322,7 @@ class Network(torch.nn.Module):
 
         self.policy_network = PolicyNetwork(state_dimension, action_dimension)
         self.value_network = ValueNetwork()
-        self.reward_network = RewardNetwork(state_dimension)
+        # self.reward_network = RewardNetwork(state_dimension)
         self.transition_network = TransitionNetwork(state_dimension)
 
     '''
@@ -446,7 +447,7 @@ def pome(environment,
     # learning rate is linearly annealed [1, 0]
     torch.optim.lr_scheduler.LinearLR(optimizer=pome_optimizer, start_factor=1., end_factor=0., total_iters=steps_per_epoch*number_of_epoch)
 
-    reward_optimizer = torch.optim.Adam(params=network.reward_network.parameters(), lr=reward_learning_rate)
+    # reward_optimizer = torch.optim.Adam(params=network.reward_network.parameters(), lr=reward_learning_rate)
     
     '''
     update all network parameters in paper. first update pome, then reward
@@ -464,12 +465,12 @@ def pome(environment,
         qf = data['qf']
         value = data['value'].squeeze()
 
-        reward_hat = network.reward_network(state, action)
+        # reward_hat = network.reward_network(state, action)
+        reward_hat = data['reward']
         transition = network.transition_network(state, action)
         transition_reshaped = transition.reshape(state.shape)
         latent_value, _, = network.policy_network(transition_reshaped)
-        qb = reward_hat + discount_factor * network.value_network(latent_value)
-        qb = qb.squeeze()
+        qb = reward_hat + discount_factor * network.value_network(latent_value).squeeze()
         data['qb'] = qb
 
         # calculate epsilon and epsilon_bar in paper
@@ -508,7 +509,6 @@ def pome(environment,
                 value = network.value_network(latent)
                 value = value.squeeze()
                 
-                
                 a_t_pome_st = (a_t_pome - a_t_pome.mean()) / (a_t_pome.std()+1e-8)
                 # calculate pome loss in paper
                 # calculate pi / pi_old
@@ -531,27 +531,27 @@ def pome(environment,
                 pome_optimizer.step()
         
         # update reward parameters
-        for i in trange(train_reward_iterations):
-            data_shuffled = shuffle_data(data, seed+i)
+        # for i in trange(train_reward_iterations):
+        #     data_shuffled = shuffle_data(data, seed+i)
 
-            for batch_index in range(int(math.floor(steps_per_subepoch / batch_size))):
-                data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size].to(device) for k, v in data_shuffled.items()}
-                state = data_minibatch['state']
-                action = data_minibatch['action']
-                reward = data_minibatch['reward']
+        #     for batch_index in range(int(math.floor(steps_per_subepoch / batch_size))):
+        #         data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size].to(device) for k, v in data_shuffled.items()}
+        #         state = data_minibatch['state']
+        #         action = data_minibatch['action']
+        #         reward = data_minibatch['reward']
 
-                reward_optimizer.zero_grad()
+        #         reward_optimizer.zero_grad()
                 
-                # calculate reward loss in paper
-                reward_hat = network.reward_network(state, action)
-                reward_object_core = reward - reward_hat                
-                reward_loss = (torch.mean(reward_object_core) ** 2)
+        #         # calculate reward loss in paper
+        #         reward_hat = network.reward_network(state, action)
+        #         reward_object_core = reward - reward_hat                
+        #         reward_loss = (torch.mean(reward_object_core) ** 2)
 
-                reward_loss.backward()
-                reward_optimizer.step()
+        #         reward_loss.backward()
+        #         reward_optimizer.step()
 
 
-        print(f'pome loss: {pome_loss}, value loss: {value_loss}, transition loss: {transition_loss}, reward loss: {reward_loss}')
+        print(f'pome loss: {pome_loss}, value loss: {value_loss}, transition loss: {transition_loss}')
         # tensorboard recording loss
         # writer.add_scalars(f'Loss summary', {
         #     'Pome loss': pome_loss,
@@ -562,7 +562,7 @@ def pome(environment,
         writer.add_scalar("Pome loss", pome_loss, global_step=(current_step))
         writer.add_scalar("Value loss", value_loss, global_step=(current_step))
         writer.add_scalar("Transition loss", transition_loss, global_step=(current_step))
-        writer.add_scalar("Reward loss", reward_loss, global_step=(current_step))
+        # writer.add_scalar("Reward loss", reward_loss, global_step=(current_step))
 
         # reset random seed
         torch.manual_seed(seed)
@@ -642,7 +642,9 @@ def pome(environment,
     # average reward of last 100 trajectories in paper
     print(f'Train Score: {np.mean(trajectory_rewards[-100:])}')
 
-    torch.save(network.state_dict(), f'./experiments/pome/model/{env_name}.pth')
+    if not os.path.exists('./experiments/pome/model/'):
+        os.makedirs('./experiments/pome/model/')
+    torch.save(network.state_dict(), f'./experiments/pome/model/{env_name}_noreward.pth')
 
     # record video
     state, info = environment.reset()
@@ -660,7 +662,9 @@ def pome(environment,
         state = process_state(next_state, state_new_size)
 
         if (terminated or truncated):
-            out = cv2.VideoWriter(f'./experiments/pome/video/{env_name}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, (screens[0].shape[1], screens[0].shape[0]))
+            if not os.path.exists('./experiments/pome/video/'):
+                os.makedirs('./experiments/pome/video/')
+            out = cv2.VideoWriter(f'./experiments/pome/video/{env_name}_noreward.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, (screens[0].shape[1], screens[0].shape[0]))
             for img in screens:
                 out.write(img)
             out.release()
@@ -670,30 +674,33 @@ def pome(environment,
 
 
 if __name__ == '__main__':
-    for env_name in ['ALE/RoadRunner-v5']:
-        # Initialize a SummaryWriter for TensorBoard
-        writer = SummaryWriter(log_dir=f'./experiments/pome/runs/{time.strftime("%Y%m%d-%H%M%S")}')
+    # Initialize a SummaryWriter for TensorBoard
 
-        print(env_name)
+    if not os.path.exists('./experiments/pome/runs/'):
+        os.makedirs('./experiments/pome/runs/')
 
-        pome(environment=gymnasium.make(env_name, obs_type='grayscale', render_mode='rgb_array'),
-            state_new_size=(84, 84),
-            networkclass=Network,
-            number_of_epoch=10,
-            steps_per_epoch=100000,
-            steps_per_subepoch=1000,
-            steps_per_trajectory=100000,
-            batch_size=5,
-            pome_learning_rate=2.5*1e-4,
-            reward_learning_rate=0.01,
-            train_pome_iterations=1,
-            train_reward_iterations=1,
-            discount_factor=0.99,
-            alpha=0.1,
-            clip_ratio=0.1,
-            value_loss_ratio=1,
-            transition_loss_ratio=2,
-            seed=24,
-            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-        
-        writer.close()
+    writer = SummaryWriter(log_dir=f'./experiments/pome/runs/{time.strftime("%Y%m%d-%H%M%S")}')
+
+    print('ALE/Robotank-v5')
+
+    pome(environment=gymnasium.make('ALE/Robotank-v5', obs_type='grayscale', render_mode='rgb_array'),
+        state_new_size=(84, 84),
+        networkclass=Network,
+        number_of_epoch=10,
+        steps_per_epoch=100000,
+        steps_per_subepoch=1000,
+        steps_per_trajectory=100000,
+        batch_size=5,
+        pome_learning_rate=2.5*1e-4,
+        reward_learning_rate=0.01,
+        train_pome_iterations=1,
+        train_reward_iterations=1,
+        discount_factor=0.99,
+        alpha=0.1,
+        clip_ratio=0.1,
+        value_loss_ratio=1,
+        transition_loss_ratio=2,
+        seed=24,
+        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    
+    writer.close()

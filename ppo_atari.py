@@ -373,11 +373,6 @@ def ppo(environment,
 
                 policy_optimizer.zero_grad()
                 
-                '''
-                note that the KL divergence in paper is not included:
-                    1. I think this is duplicated with the clip trick
-                    2. the value of coefficient Beta is not mentioned
-                '''
                 advantage = (advantage - advantage.mean()) / (advantage.std()+1e-8)
                 # get policy, action probability in log and value
                 latent, policy = network.policy_network(state)
