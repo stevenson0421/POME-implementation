@@ -454,7 +454,7 @@ def pome(environment,
                                        {'params':network.value_network.parameters()},
                                        {'params':network.transition_network.parameters()},], lr=pome_learning_rate)
     # learning rate is linearly annealed [1, 0]
-    torch.optim.lr_scheduler.LinearLR(optimizer=pome_optimizer, start_factor=1., end_factor=0., total_iters=steps_per_subepoch*number_of_subepoch)
+    torch.optim.lr_scheduler.LinearLR(optimizer=pome_optimizer, start_factor=1., end_factor=0., total_iters=steps_per_epoch)
 
     # reward_optimizer = torch.optim.Adam(params=network.reward_network.parameters(), lr=reward_learning_rate)
     
@@ -478,15 +478,16 @@ def pome(environment,
         reward_hat = data['reward']
         transition = network.transition_network(state, action)
         transition_reshaped = transition.reshape(state.shape)
-        _, _, value = network.train_step(transition_reshaped)
-        qb = reward_hat + discount_factor * value
+        _, _, value_t = network.train_step(transition_reshaped)
+        qb = reward_hat + discount_factor * value_t
         data['qb'] = qb
 
         # calculate epsilon and epsilon_bar in paper
+        alpha_a = alpha * (1 - current_step / number_of_subepoch)
         epsilon = torch.abs(qf - qb)
         epsilon_median = torch.median(epsilon)
         delta_t = torch.abs(qf - value)
-        delta_t_pome = qf + alpha * torch.clamp(epsilon-epsilon_median, -delta_t, delta_t) - value
+        delta_t_pome = qf + alpha_a * torch.clamp(epsilon-epsilon_median, -delta_t, delta_t) - value
         # calculate a_t_pome in paper
         data['a_t_pome'] = discounted_cumulated_sum(delta_t_pome, 1, device)
 
@@ -619,7 +620,7 @@ def pome(environment,
                         last_value = 0
                     buffer.done(last_value)
                     # reset the environment. this is important!
-                    state = environment.reset(seed=seed)
+                    state = environment.reset(seed=seed+current_step)
                     state = process_state(next_state, state_new_size)
                     # record total reward and reset
                     print(f'trajectory ends with step {step}: trajectory_reward: {trajectory_reward}, trajectory_length: {trajectory_length}')
@@ -648,7 +649,7 @@ def pome(environment,
 
     if not os.path.exists('./experiments/pome/model/'):
         os.makedirs('./experiments/pome/model/')
-    torch.save(network.state_dict(), f'./experiments/pome/model/{env_name}_noreward.pth')
+    torch.save(network.state_dict(), f'./experiments/pome/model/{env_name}{postfix}.pth')
 
     # record video
     state, info = environment.reset(seed=seed)
@@ -668,7 +669,7 @@ def pome(environment,
         if (terminated or truncated):
             if not os.path.exists('./experiments/pome/video/'):
                 os.makedirs('./experiments/pome/video/')
-            out = cv2.VideoWriter(f'./experiments/pome/video/{env_name}_noreward.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, (screens[0].shape[1], screens[0].shape[0]))
+            out = cv2.VideoWriter(f'./experiments/pome/video/{env_name}{postfix}.avi',cv2.VideoWriter_fourcc(*'DIVX'), 60, (screens[0].shape[1], screens[0].shape[0]))
             for img in screens:
                 out.write(img)
             out.release()
@@ -679,7 +680,9 @@ def pome(environment,
 
 if __name__ == '__main__':
 
-    env_name = 'ALE/Amidar-v5'
+    env_name = 'ALE/RoadRunner-v5'
+
+    postfix = '_annealalpha_long'
 
     if not os.path.exists('./experiments/pome/runs/'):
         os.makedirs('./experiments/pome/runs/')
@@ -692,10 +695,10 @@ if __name__ == '__main__':
         state_new_size=(84, 84),
         networkclass=Network,
         number_of_epoch=10,
-        steps_per_epoch=100000,
-        steps_per_subepoch=1000,
+        steps_per_epoch=1000000,
+        steps_per_subepoch=10000,
         steps_per_trajectory=100000,
-        batch_size=5,
+        batch_size=100,
         pome_learning_rate=2.5*1e-4,
         reward_learning_rate=0.01,
         train_pome_iterations=1,

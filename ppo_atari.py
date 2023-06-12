@@ -113,8 +113,9 @@ class Buffer:
         reward_list = np.append(self.reward_buffer[trajectory_slice], last_value)
         value_list = np.append(self.value_buffer[trajectory_slice], last_value)
 
-        # calculate Q_ft in paper
-        self.advantage_buffer[trajectory_slice] = reward_list[:-1] + self.discount_factor * value_list[1:] - value_list[:-1]
+        # calculate advantage with GAE
+        deltas = reward_list[:-1] + self.discount_factor * value_list[1:] - value_list[:-1]
+        self.advantage_buffer[trajectory_slice] = discounted_cumulated_sum(deltas, self.discount_factor)
 
         # calculate reward-to-go (discounted cumulated reward)
         self.reward_to_go_buffer[trajectory_slice] = discounted_cumulated_sum(reward_list, self.discount_factor)[:-1]
