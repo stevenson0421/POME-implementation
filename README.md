@@ -14,7 +14,7 @@ Tensorboard logged datas will be located below runs/ directory, to visualize dat
 
 ```python
     tensorboard --logdir runs or
-    python -m tensorboard.main --logdir=runs
+    python -m tensorboard.main --logdir=./experiments/{algo}/runs
 ```
 
 ## Todos

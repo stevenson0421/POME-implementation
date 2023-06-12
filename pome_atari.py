@@ -44,15 +44,6 @@ def process_state(state, new_size):
     return state_normalized
 
 '''
-set random seeds for reproducibility
-'''
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-
-'''
 shuffle all data in a dictionary
 '''
 def shuffle_data(data, seed):
@@ -89,7 +80,6 @@ class Buffer:
         self.pointer = 0
         self.start_index = 0
         self.max_size = size
-
         self.device = device
     
     '''
@@ -332,11 +322,25 @@ class Network(torch.nn.Module):
         action_logprobability = policy_distribution.log_prob(action)
         
         return action_logprobability
+    
+    '''
+    get action, log probability of the action and value estimation from a state
+    return as tensor for training
+    '''
+    def train_step(self, state):
+        latent, policy = self.policy_network(state)
+            
+        action = self.policy_network.policy_distribution.sample()
+        action_logprobability = self.policy_network.policy_distribution.log_prob(action)
+        value = self.value_network(latent)
+
+        return action, action_logprobability, value.squeeze()
 
     '''
     get action, log probability of the action and value estimation from a state
+    return as np array for environment interacting
     '''
-    def step(self, state):
+    def eval_step(self, state):
         with torch.no_grad():
             latent, policy = self.policy_network(state)
             
@@ -348,13 +352,13 @@ class Network(torch.nn.Module):
     '''
     get action only from a state
 
-    this function is not used yet, maybe for evaluation
+    this function is used for evaluation
     '''
     def act(self, state):
         with torch.no_grad():
             latent, policy = self.policy_network(state)
             action = self.policy_network.policy_distribution.sample()
-        return action.cpu().numpy()
+        return action.cpu().numpy().item()
 
 
 '''
@@ -426,11 +430,16 @@ def pome(environment,
     
     assert isinstance(environment.action_space, gymnasium.spaces.Discrete)
 
-    set_seed(seed)
+    number_of_subepoch = int(math.floor(steps_per_epoch / steps_per_subepoch))
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
 
     env_name = environment.unwrapped.spec.id.replace('/', '_')
     
-    # current implementation (210, 160)
+    # current implementation (1, 84, 84)
     # state_space = environment.observation_space
     state_dimension = (1, state_new_size[0], state_new_size[1])
     # current implementation Discrete(6)
@@ -445,7 +454,7 @@ def pome(environment,
                                        {'params':network.value_network.parameters()},
                                        {'params':network.transition_network.parameters()},], lr=pome_learning_rate)
     # learning rate is linearly annealed [1, 0]
-    torch.optim.lr_scheduler.LinearLR(optimizer=pome_optimizer, start_factor=1., end_factor=0., total_iters=steps_per_epoch*number_of_epoch)
+    torch.optim.lr_scheduler.LinearLR(optimizer=pome_optimizer, start_factor=1., end_factor=0., total_iters=steps_per_subepoch*number_of_subepoch)
 
     # reward_optimizer = torch.optim.Adam(params=network.reward_network.parameters(), lr=reward_learning_rate)
     
@@ -463,14 +472,14 @@ def pome(environment,
         state = data['state']
         action = data['action']
         qf = data['qf']
-        value = data['value'].squeeze()
+        value = data['value']
 
         # reward_hat = network.reward_network(state, action)
         reward_hat = data['reward']
         transition = network.transition_network(state, action)
         transition_reshaped = transition.reshape(state.shape)
-        latent_value, _, = network.policy_network(transition_reshaped)
-        qb = reward_hat + discount_factor * network.value_network(latent_value).squeeze()
+        _, _, value = network.train_step(transition_reshaped)
+        qb = reward_hat + discount_factor * value
         data['qb'] = qb
 
         # calculate epsilon and epsilon_bar in paper
@@ -486,11 +495,11 @@ def pome(environment,
             data_shuffled = shuffle_data(data, seed+i)
 
             for batch_index in range(int(math.floor(steps_per_subepoch / batch_size))):
+                # note that these are fixed during one epoch update
                 data_minibatch = {k:v[batch_index*batch_size:(batch_index+1)*batch_size].to(device) for k, v in data_shuffled.items()}
                 state = data_minibatch['state']
                 action = data_minibatch['action']
                 reward_to_go = data_minibatch['reward_to_go']
-                # pi_old, note that this is fixed during one epoch update
                 action_logprobability_old = data_minibatch['action_logprobability']
                 a_t_pome = data_minibatch['a_t_pome']
 
@@ -503,16 +512,12 @@ def pome(environment,
                 '''
                 
                 # get policy, action probability in log and value
-                latent, policy = network.policy_network(state)
-                action_logprobability = network.policy_network.policy_distribution.log_prob(action)
-
-                value = network.value_network(latent)
-                value = value.squeeze()
-                
-                a_t_pome_st = (a_t_pome - a_t_pome.mean()) / (a_t_pome.std()+1e-8)
+                action, action_logprobability, value = network.train_step(state)
                 # calculate pome loss in paper
                 # calculate pi / pi_old
                 policy_ratio = torch.exp(action_logprobability-action_logprobability_old)
+
+                a_t_pome_st = (a_t_pome - a_t_pome.mean()) / (a_t_pome.std()+1e-8)
                 clip_a_t_pome = torch.clamp(policy_ratio, 1-clip_ratio, 1+clip_ratio) * a_t_pome_st
                 pome_loss = -(torch.min(policy_ratio * a_t_pome_st, clip_a_t_pome)).mean()
 
@@ -524,7 +529,7 @@ def pome(environment,
                 # calculate transition loss in paper. note that state of 0:-1 are used for calculation, not sure if this is correct
                 transition = network.transition_network(state[:-1], action[:-1])
                 transition_reshaped = transition.reshape((state.shape[0]-1, state.shape[1], state.shape[2], state.shape[3]))
-                transition_loss = (torch.norm(state[:-1]-transition_reshaped, p=2) ** 2) / torch.numel(state)
+                transition_loss = (torch.norm(state[:-1]-transition_reshaped, p=2) ** 2) / torch.numel(transition_reshaped)
 
                 total_pome_loss = pome_loss + value_loss_ratio * value_loss + transition_loss_ratio * transition_loss
                 total_pome_loss.backward()
@@ -573,14 +578,12 @@ def pome(environment,
     trajectory_rewards = []
 
     start_time = time.time()
-    state, info = environment.reset()
+    state, info = environment.reset(seed=seed)
     state = process_state(state, state_new_size)
 
     total_steps = 0
     
     for epoch in range(number_of_epoch):
-        number_of_subepoch = int(math.floor(steps_per_epoch / steps_per_subepoch))
-
         for subepoch in range(number_of_subepoch):
             
             print('interacting phase')
@@ -590,7 +593,7 @@ def pome(environment,
             print('current_step: ', current_step)
             for step in range(steps_per_subepoch):
                 # get action, action probability in log, value from a state. note that state is unsqueezed as a batch with size 1
-                action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
+                action, action_logprobability, value = network.eval_step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
 
                 # agent interaction
                 next_state, reward, terminated, truncated, info = environment.step(action)
@@ -611,12 +614,12 @@ def pome(environment,
                         print('Warning: trajectory cut off by epoch at %d steps.'%trajectory_length)
 
                     if timeout or epoch_ended:
-                        _, last_value, _ = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
+                        _, last_value, _ = network.eval_step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
                     else:
                         last_value = 0
                     buffer.done(last_value)
                     # reset the environment. this is important!
-                    state = environment.reset()
+                    state = environment.reset(seed=seed)
                     state = process_state(next_state, state_new_size)
                     # record total reward and reset
                     print(f'trajectory ends with step {step}: trajectory_reward: {trajectory_reward}, trajectory_length: {trajectory_length}')
@@ -638,6 +641,7 @@ def pome(environment,
             network.to(device)
 
             update(current_step)
+
     print(f'Train Time: {(time.time() - start_time):2f} seconds')
     # average reward of last 100 trajectories in paper
     print(f'Train Score: {np.mean(trajectory_rewards[-100:])}')
@@ -647,7 +651,7 @@ def pome(environment,
     torch.save(network.state_dict(), f'./experiments/pome/model/{env_name}_noreward.pth')
 
     # record video
-    state, info = environment.reset()
+    state, info = environment.reset(seed=seed)
     state = process_state(state, state_new_size)
     screens = []
 
@@ -655,7 +659,7 @@ def pome(environment,
 
     screens = []
     while True:
-        action, action_logprobability, value = network.step(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
+        action = network.act(torch.as_tensor(state, dtype=torch.float32, device='cpu').unsqueeze(0))
         next_state, reward, terminated, truncated, info = environment.step(action)
         frame = environment.render()
         screens.append(frame)
@@ -674,16 +678,17 @@ def pome(environment,
 
 
 if __name__ == '__main__':
-    # Initialize a SummaryWriter for TensorBoard
+
+    env_name = 'ALE/Amidar-v5'
 
     if not os.path.exists('./experiments/pome/runs/'):
         os.makedirs('./experiments/pome/runs/')
-
+    # Initialize a SummaryWriter for TensorBoard
     writer = SummaryWriter(log_dir=f'./experiments/pome/runs/{time.strftime("%Y%m%d-%H%M%S")}')
 
-    print('ALE/Robotank-v5')
+    print(env_name)
 
-    pome(environment=gymnasium.make('ALE/Robotank-v5', obs_type='grayscale', render_mode='rgb_array'),
+    pome(environment=gymnasium.make(env_name, obs_type='grayscale', render_mode='rgb_array'),
         state_new_size=(84, 84),
         networkclass=Network,
         number_of_epoch=10,
